@@ -9,8 +9,9 @@
 // Implied value follows only from the snapshot's own figures:
 //
 //   peerMult   = the median market-cap/TVL ratio of the LIVE-token protocols in the same
-//                DefiLlama category, read from this same snapshot (a category with fewer
-//                than PEER_MIN_COUNT live peers falls back to the global median), clamped
+//                DefiLlama category, read from this same snapshot, clamped. Fallback chain
+//                when a level has fewer than PEER_MIN_COUNT live peers: the category's
+//                family median (lending, trading, staking, ...), then the global median
 //   growth     = clamp(change_7d, -50, 100) per cent
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
 //   maturity   = 0.65 + min(age_days, 1095) / 1095 x 0.35   (age_days unknown: 365)
@@ -80,7 +81,31 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-2.1';
+
+/**
+ * Category families for the peer fallback: when a category has too few live peers to set its own
+ * multiple, its family's live peers set one instead. Keyword groups over DefiLlama category names,
+ * applied in order; a category that matches nothing lands in 'Other protocols'.
+ */
+const FAMILIES: [string, string[]][] = [
+  ['Lending & credit', ['lend', 'cdp', 'collateral', 'credit']],
+  ['Trading & exchange', ['dex', 'swap', 'exchange', 'aggregator', 'perpetual', 'derivative', 'option']],
+  ['Yield & vaults', ['yield', 'curator', 'allocator', 'vault', 'farm']],
+  ['Staking', ['staking', 'restak']],
+  ['Payments & stablecoins', ['stable', 'payment', 'fiat']],
+  ['Bridges & chains', ['bridge', 'chain', 'interoperab']],
+  ['Real-world assets', ['rwa', 'real world', 'tokeniz']],
+  ['Markets & gaming', ['prediction', 'gaming', 'game', 'betting', 'lottery']],
+  ['Infrastructure', ['oracle', 'indexer', 'data', 'locker', 'launchpad', 'insurance']],
+];
+
+/** The family one DefiLlama category belongs to. */
+export function familyOf(category: string | null): string {
+  const c = (category ?? '').toLowerCase();
+  for (const [name, keys] of FAMILIES) if (keys.some((k) => c.includes(k))) return name;
+  return 'Other protocols';
+}
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -114,6 +139,7 @@ export interface BoardRow {
   model: {
     peer_multiple: number;
     peer_count: number;
+    peer_source: string;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -138,6 +164,7 @@ export interface RadarRow {
   implied_value_usd: number;
   peer_multiple: number;
   peer_count: number;
+  peer_source: string;
   growth_multiplier: number;
   maturity_multiplier: number;
   breadth_multiplier: number;
@@ -155,11 +182,12 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** One category's peer multiple: the median live market-cap/TVL and how many live peers set it. */
+/** One board category's effective peer multiple: the median that values it, its peer count, its level. */
 export interface PeerMultiple {
   category: string | null;
   multiple: number;
   peers: number;
+  source: string;
 }
 
 /** Everything the dashboard needs: the board, the live set, and the model it runs. */
@@ -204,9 +232,10 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/** The peer multiples of one snapshot: per-category medians of live mcap/TVL, plus the global one. */
+/** The peer multiples of one snapshot: per-category and per-family medians of live mcap/TVL, plus the global one. */
 export interface PeerTable {
   byCategory: Map<string, { multiple: number; count: number }>;
+  byFamily: Map<string, { multiple: number; count: number }>;
   global: { multiple: number; count: number };
 }
 
@@ -220,6 +249,7 @@ function medianOf(xs: number[]): number {
 export function peerTable(snapshot: Snapshot, model: ModelConstants): PeerTable {
   const clampPeer = (x: number): number => Math.min(model.peer_clamp_hi, Math.max(model.peer_clamp_lo, x));
   const ratios = new Map<string, number[]>();
+  const familyRatios = new Map<string, number[]>();
   const all: number[] = [];
   for (const p of snapshot.protocols) {
     if (isPreToken(p) || p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
@@ -229,19 +259,36 @@ export function peerTable(snapshot: Snapshot, model: ModelConstants): PeerTable 
     const arr = ratios.get(key) ?? [];
     arr.push(r);
     ratios.set(key, arr);
+    const fam = familyOf(p.category);
+    const farr = familyRatios.get(fam) ?? [];
+    farr.push(r);
+    familyRatios.set(fam, farr);
   }
   const byCategory = new Map<string, { multiple: number; count: number }>();
   for (const [key, xs] of ratios) byCategory.set(key, { multiple: clampPeer(medianOf(xs)), count: xs.length });
-  return { byCategory, global: { multiple: all.length > 0 ? clampPeer(medianOf(all)) : model.peer_clamp_lo, count: all.length } };
+  const byFamily = new Map<string, { multiple: number; count: number }>();
+  for (const [key, xs] of familyRatios) byFamily.set(key, { multiple: clampPeer(medianOf(xs)), count: xs.length });
+  return { byCategory, byFamily, global: { multiple: all.length > 0 ? clampPeer(medianOf(all)) : model.peer_clamp_lo, count: all.length } };
 }
 
-/** The peer multiple one protocol is valued at: its category's, or the global one when peers are few. */
-export function peerFor(table: PeerTable, category: string | null, model: ModelConstants): { multiple: number; count: number } {
-  // Rounded to the same 4 places data.js publishes, so the dashboard's recompute of a row from the
-  // published peer table lands on exactly the number the board carries.
+/** The peer multiple one protocol is valued at, and which level of the fallback chain set it. */
+export interface EffectivePeer {
+  multiple: number;
+  count: number;
+  source: 'category' | 'family' | 'global';
+}
+
+/**
+ * The fallback chain: the category's own median when it has enough live peers, else its family's
+ * median, else the global median. Rounded to the same 4 places data.js publishes, so the dashboard's
+ * recompute of a row from the published peer table lands on exactly the number the board carries.
+ */
+export function effectivePeer(table: PeerTable, category: string | null, model: ModelConstants): EffectivePeer {
   const hit = table.byCategory.get(category ?? '');
-  if (hit !== undefined && hit.count >= model.peer_min_count) return { multiple: round4(hit.multiple), count: hit.count };
-  return { multiple: round4(table.global.multiple), count: table.global.count };
+  if (hit !== undefined && hit.count >= model.peer_min_count) return { multiple: round4(hit.multiple), count: hit.count, source: 'category' };
+  const fam = table.byFamily.get(familyOf(category));
+  if (fam !== undefined && fam.count >= model.peer_min_count) return { multiple: round4(fam.multiple), count: fam.count, source: 'family' };
+  return { multiple: round4(table.global.multiple), count: table.global.count, source: 'global' };
 }
 
 /** The factors and the implied value one protocol gets under `model`. */
@@ -304,7 +351,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
 
   const peers = peerTable(snapshot, model);
   const scored = [...chosen.values()].map((p) => {
-    const peer = peerFor(peers, p.category, model);
+    const peer = effectivePeer(peers, p.category, model);
     const { implied, growthPct, growthMult, maturityMult, breadthMult, age } = impliedValue(p, snapshot.as_of, model, peer.multiple);
     return { p, implied, peer, growthPct, growthMult, maturityMult, breadthMult, age };
   });
@@ -327,6 +374,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     model: {
       peer_multiple: round4(s.peer.multiple),
       peer_count: s.peer.count,
+      peer_source: s.peer.source,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -516,6 +564,7 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     peer_multiple: row.model.peer_multiple,
     peer_count: row.model.peer_count,
+    peer_source: row.model.peer_source,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     breadth_multiplier: row.model.breadth_multiplier,
@@ -529,9 +578,15 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const table = peerTable(snapshot, model);
-  const peers: PeerMultiple[] = [...table.byCategory.entries()]
-    .map(([category, v]) => ({ category: category === '' ? null : category, multiple: round4(v.multiple), peers: v.count }))
-    .sort((a, b) => b.multiple - a.multiple || b.peers - a.peers);
+  const seenPeers = new Map<string, PeerMultiple>();
+  for (const r of board) {
+    const key = r.category ?? '';
+    if (!seenPeers.has(key)) {
+      const ep = effectivePeer(table, r.category, model);
+      seenPeers.set(key, { category: r.category, multiple: ep.multiple, peers: ep.count, source: ep.source });
+    }
+  }
+  const peers: PeerMultiple[] = [...seenPeers.values()].sort((a, b) => b.multiple - a.multiple || b.peers - a.peers);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,

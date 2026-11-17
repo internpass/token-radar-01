@@ -28,12 +28,13 @@
   }
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
-  // The peer multiple is read from the peer table data.js carries: the median market-cap/TVL of the
-  // live-token protocols in the row's own category, or the global median when its peers are few.
+  // The peer multiple is read from the effective peer table data.js carries: for each board category,
+  // the median market-cap/TVL of its live peers, or of its category family's, or the global median,
+  // whichever level of the fallback chain had enough live peers to set it.
   function peerMultipleOf(row, model) {
     var list = DATA.peers || [];
     for (var i = 0; i < list.length; i++) {
-      if (list[i].category === row.category && list[i].peers >= model.peer_min_count) return list[i].multiple;
+      if (list[i].category === row.category) return list[i].multiple;
     }
     return DATA.global_multiple;
   }
@@ -250,16 +251,16 @@
 
   function modelPanel() {
     var m = DATA.model;
-    var peerRows = (DATA.peers || []).filter(function (x) { return x.peers >= m.peer_min_count; }).slice(0, 12);
+    var peerRows = (DATA.peers || []).slice(0, 14);
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The anchor is a peer multiple: a pre-token protocol is valued at the median market-cap/TVL the market already pays for live-token protocols of its own category in this same snapshot, so the ranking is not a TVL table.' }),
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x peer_multiple(category) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + ' + m.breadth_weight + ' x min(extra chains, ' + m.breadth_max_chains + ')) )'
       ),
-      el('p', { class: 'sub', text: 'Peer multiples from this snapshot (median live market cap / TVL, clamped to ' + m.peer_clamp_lo + '..' + m.peer_clamp_hi + '; a category with fewer than ' + m.peer_min_count + ' live peers uses the global median ' + DATA.global_multiple + 'x from ' + DATA.global_peers + ' live protocols):' }),
+      el('p', { class: 'sub', text: 'Effective peer multiples from this snapshot (median live market cap / TVL, clamped to ' + m.peer_clamp_lo + '..' + m.peer_clamp_hi + '). Each board category is valued at its own median when at least ' + m.peer_min_count + ' live peers set one, else at its category family median (lending, trading, staking and so on), else at the global median ' + DATA.global_multiple + 'x from ' + DATA.global_peers + ' live protocols:' }),
       el('ul', { class: 'peers' }, peerRows.map(function (x) {
-        return el('li', null, el('b', { text: (x.category || 'Uncategorised') + ' ' + x.multiple + 'x' }), document.createTextNode(' from ' + x.peers + ' live peers'));
+        return el('li', null, el('b', { text: (x.category || 'Uncategorised') + ' ' + x.multiple + 'x' }), document.createTextNode(' from ' + x.peers + ' live peers, ' + x.source + ' median'));
       })),
       el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The early radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.' })
     );
@@ -287,7 +288,7 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Peer multiple' }), el('b', { class: 'num', text: String(row.peer_multiple) + 'x (' + row.peer_count + ' live peers)' })),
+        el('div', null, el('span', { text: 'Peer multiple' }), el('b', { class: 'num', text: String(row.peer_multiple) + 'x (' + row.peer_count + ' live peers, ' + row.peer_source + ' median)' })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
